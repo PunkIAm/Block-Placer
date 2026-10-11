@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*$py.class
+
+# Debug / build artifacts (local logs + old test render)
+err.txt
+out.txt
+run.txt
+frame.png
+
+# Environment / local
+.venv
+env/
+*.env
+.env.*
