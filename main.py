@@ -149,28 +149,71 @@ FACE_SHADE = {
 }
 
 # -----------------------------------------------------------------------------
-# handcrafted Cubic-Odyssey style map
+# endless procedural terrain + handcrafted Cubic-Odyssey landmarks
 # -----------------------------------------------------------------------------
 def _between(v, a, b):
     return a <= v <= b
 
-def terrain_top(x, z):
-    """Return top y for a column (int) or None outside the map."""
-    if not (_between(x, -30, 30) and _between(z, -30, 30)):
-        return None
-    top = 4
-    # West basin: a low depression in the southwest
-    if _between(x, -30, -20) and _between(z, -12, 12):
-        top = 3
-    # East hill: ramps up toward +z, summit at z=30
-    if _between(z, 20, 30) and x >= 0:
-        top = max(top, 4 + (z - 20))
-    return int(top)
+# -----------------------------------------------------------------------------
+# procedural endless terrain (value-noise FBM — no hard boundaries)
+# -----------------------------------------------------------------------------
+_TERRAIN_BASE = 5.0     # mean ground height (block index)
+_TERRAIN_AMP  = 3.0     # hill amplitude (half-range) in blocks -> walkable 2..8
 
-@lru_cache(maxsize=None)
-def _raw_block(x, z, y):
-    """Deterministic block at (x,z,y). Returns name or None. Pure/cacheable."""
-    top = terrain_top(x, z)
+def _rand2(ix, iz, seed):
+    """Deterministic pseudo-random in [0,1) for integer lattice point (ix,iz)."""
+    h = ((ix * 2654435761) + (iz * 1442695040) + seed) & 0xFFFFFFFF
+    h = ((h ^ (h >> 16)) * 0x85EBCA6B) & 0xFFFFFFFF
+    h = ((h ^ (h >> 13)) * 0xC2B2AE35) & 0xFFFFFFFF
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    return h / 4294967296.0
+
+def _noise2(x, z, seed):
+    """Smooth value noise in [0,1)."""
+    ix = int(math.floor(x)); iz = int(math.floor(z))
+    fx = x - ix; fz = z - iz
+    def smoothstep(t): return t*t*(3.0 - 2.0*t)
+    u = smoothstep(fx); v = smoothstep(fz)
+    a = _rand2(ix, iz, seed)
+    b = _rand2(ix + 1, iz, seed)
+    c = _rand2(ix, iz + 1, seed)
+    d = _rand2(ix + 1, iz + 1, seed)
+    top = a + (b - a) * u
+    bot = c + (d - c) * u
+    return bot + (top - bot) * v
+
+def _fbm(x, z, seed):
+    """Fractal Brownian motion (3 octaves) in [0,1)."""
+    total = 0.0; amp = 1.0; freq = 1.0
+    for _ in range(3):
+        total += _noise2(x * freq, z * freq, seed) * amp
+        amp *= 0.5; freq *= 2.0
+    return total / 1.75
+
+def terrain_top(x, z):
+    """Return top y for a column (int), for ANY (x,z).
+    Procedural (no boundaries): smooth FBM noise so the terrain is endless,
+    continuous and free of dead-end staircases.  Clamped to a walkable range."""
+    # Keep the handcrafted settlement on level ground so the houses, well and
+    # lighthouse don't float or sink on the rolling terrain.
+    if _between(x, 9, 29) and _between(z, -20, -8):
+        return 4
+    n = _fbm(x * 0.05, z * 0.05, 1337)
+    h = _TERRAIN_BASE + int(round(_TERRAIN_AMP * (n - 0.5)))
+    return max(2, min(HY - 3, int(h)))
+
+def _surface_y(x, z):
+    """World-Y coordinate of the ground top (feet level) under (x,z)."""
+    t = terrain_top(x, z)
+    return float(t + 1) if t is not None else 5.0
+
+
+def _raw_block(x, z, y, top=None):
+    """Deterministic block at (x,z,y). Returns name or None.
+    `top` may be supplied (already computed) to avoid re-doing noise lookups;
+    when omitted it is derived from terrain_top."""
+    if top is None:
+        top = terrain_top(x, z)
     if top is None or y > top + 14:
         return None
     if y <= top:
@@ -349,29 +392,64 @@ def _lighthouse_blocks(x, z, y):
     return None
 # -----------------------------------------------------------------------------
 class World:
+    """Endless, chunk-streamed voxel world.
+
+    Columns are generated on demand (lazy) and evicted once they are far from
+    the player and carry no player edits.  Player edits are stored in ``over``
+    (persistent, keyed by (x,y,z)) and folded into generated columns, so they
+    survive eviction.  Landmark columns (the Cubic-Odyssey settlement + lighthouse)
+    are never evicted so quests always work.
+    """
+    SETTLE_X0, SETTLE_X1 = 8, 30
+    SETTLE_Z0, SETTLE_Z1 = -21, -7
+
     def __init__(self, seed=1337):
         self.seed = seed
-        self.static = {}      # (x,y,z) -> name  (precomputed static map)
-        self.over = {}        # (x,y,z) -> name  (player overrides / None)
-        # precompute static content
-        for x in range(-30, 31):
-            for z in range(-30, 31):
-                for y in range(0, HY + 1):
-                    b = _raw_block(x, z, y)
-                    if b is not None:
-                        self.static[(x, y, z)] = b
-        # Per-column index for fast rendering: (x, z) -> {y: name}.
-        # Mirrors the *current* block state (base + player edits) so build_quads
-        # iterates only existing blocks and culls faces by neighbor lookup.
-        self.colblocks = {}
-        for (x, y, z), name in self.static.items():
-            self.colblocks.setdefault((x, z), {})[y] = name
+        self.over = {}            # (x,y,z) -> name or None  (persistent player edits)
+        self.colblocks = {}       # (x,z) -> {y: name}       generated + merged columns
+        self._edited_cols = set() # (x,z) that have any over-edit (never evicted)
+
+    def _gen_col(self, cx, cz):
+        """Build the merged column at (cx,cz): base terrain + this column's
+        persistent player edits.  Called only when the column is first needed
+        (or re-built after an eviction).  terrain_top is computed ONCE here so
+        _raw_block does not repeat the expensive noise lookups per block.
+        Loops through top+14 to capture full feature height (village,
+        lighthouse, trees, flag, etc)."""
+        top = terrain_top(cx, cz)
+        col = {}
+        for y in range(0, top + 15):
+            b = _raw_block(cx, cz, y, top)
+            if b is not None:
+                col[y] = b
+        # fold persistent player edits for this column
+        for (xx, yy, zz), name in self.over.items():
+            if (xx, zz) != (cx, cz):
+                continue
+            if name is None:
+                col.pop(yy, None)
+            else:
+                col[yy] = name
+        self.colblocks[(cx, cz)] = col
+        return col
+
+    def _col(self, cx, cz):
+        """Return the (x,z) column block map, generating it lazily if needed."""
+        col = self.colblocks.get((cx, cz))
+        if col is None:
+            col = self._gen_col(cx, cz)
+        return col
 
     def block(self, x, y, z):
+        """Current block name at (x,y,z), or None.  Lazy: generates the column
+        on demand (this is what makes the world endless)."""
         k = (x, y, z)
         if k in self.over:
             return self.over[k]
-        return self.static.get(k)
+        col = self.colblocks.get((x, z))
+        if col is None:
+            col = self._gen_col(x, z)
+        return col.get(y)
 
     def opaque(self, x, y, z):
         b = self.block(x, y, z)
@@ -381,18 +459,35 @@ class World:
         return not self.opaque(x, y, z)
 
     def set(self, x, y, z, name):
-        self.over[(x, y, z)] = name
-        col = self.colblocks.setdefault((x, z), {})
+        """Place (name) or mine (None) a block.  Persists the edit in ``over``
+        and merges it into the generated column."""
+        k = (x, y, z)
+        self.over[k] = name
+        if name is not None:
+            self._edited_cols.add((x, z))
+        col = self.colblocks.get((x, z))
+        if col is None:
+            col = self._gen_col(x, z)
         if name is None:
             col.pop(y, None)
         else:
             col[y] = name
+        self.colblocks[(x, z)] = col
 
-    def _build(self, cx, cz):
-        pass
-
-    def _ensure(self, cx, cz):
-        pass
+    def evict(self, cx, cz, margin=3):
+        """Drop columns that are far from (cx,cz) AND carry no player edits.
+        The settlement + lighthouse are always kept so quests never break."""
+        r = RADIUS_BY_Q[QUALITY] + margin
+        for key in list(self.colblocks.keys()):
+            x, z = key
+            if abs(x - cx) <= r or abs(z - cz) <= r:
+                continue
+            if (x, z) in self._edited_cols:
+                continue
+            if _between(x, self.SETTLE_X0, self.SETTLE_X1) and \
+               _between(z, self.SETTLE_Z0, self.SETTLE_Z1):
+                continue
+            del self.colblocks[key]
 
 
 # -----------------------------------------------------------------------------
@@ -421,12 +516,22 @@ def make_camera(player, world):
     cp = math.cos(player.pitch)
     hx, hz = math.sin(player.yaw), -math.cos(player.yaw)
     fx, fy, fz = hx * cp, -math.sin(player.pitch), hz * cp
+    # Third-person: put the eye a fixed distance behind the player's HEAD,
+    # measured along the *aim* direction (fx,fy,fz, i.e. yaw + pitch).
+    # Because the eye is offset along the forward vector, the player's head
+    # always projects to the exact screen centre: looking up/down rotates the
+    # world around the player (who stays fixed) instead of orbiting around a
+    # fixed camera point.  We still add CAM_LIFT to the head y so the default
+    # framing sits a touch above the player's feet, like GTA.
     if player.first_person:
         eye = (player.x, player.y + EYE_H, player.z)
     else:
-        eye = (player.x - CAM_DISTANCE * hx,
-               player.y + EYE_H + CAM_LIFT,
-               player.z - CAM_DISTANCE * hz)
+        eye_y = (player.y + EYE_H + CAM_LIFT)
+        eye = (
+            player.x - fx * CAM_DISTANCE,
+            eye_y - fy * CAM_DISTANCE,
+            player.z - fz * CAM_DISTANCE,
+        )
     return eye, normalize((fx, fy, fz))
 
 def proj(p, eye, f):
@@ -501,8 +606,6 @@ def raycast(player, world, cam, dist=30.0):
             bz += stepz
             ttz += 1.0 / abs(dz)
             nx, ny, nz = 0.0, 0.0, stepz
-        if not (_between(bx, -31, 31) and _between(bz, -31, 31)):
-            break
         if by < -1 or by >= HY + 8:
             break
         if world.block(bx, by, bz) is not None:
@@ -519,7 +622,7 @@ def place_block(player, world, cam):
         return
     # only place on a valid face, within bounds, and only on an empty cell
     wx, wy, wz = bx - nx, by - ny, bz - nz
-    if wy < 0 or wy >= HY + 6 or not (_between(wx, -31, 31) and _between(wz, -31, 31)):
+    if wy < 0 or wy >= HY + 6:
         return
     if world.block(wx, wy, wz) is not None:
         return
@@ -654,7 +757,8 @@ def update_mining(player, world, dt, cam, mouse_down):
 class Player:
     def __init__(self, world):
         self.world = world
-        self.x, self.y, self.z = 0.0, 5.5, 0.0
+        self.x, self.z = 0.0, 0.0
+        self.y = _surface_y(self.x, self.z) + 1.0   # spawn a bit above the generated ground
         self.vx, self.vy, self.vz = 0.0, 0.0, 0.0
         self.grounded = False
         self.first_person = False
@@ -676,7 +780,9 @@ class Player:
 
 
 def respawn(player):
-    player.x, player.y, player.z = 0.0, 5.5, 0.0
+    # respawn on the generated ground under the spawn column, never inside a block
+    player.x, player.z = 0.0, 0.0
+    player.y = _surface_y(player.x, player.z) + 1.0
     player.vx, player.vy, player.vz = 0.0, 0.0, 0.0
     player.grounded = False
 
@@ -785,7 +891,6 @@ def move_player(world, player, dt):
 
     # --- X (with climb-up) ---
     nx = player.x + dx
-    nx = max(-30.0, min(30.0, nx))
     if not collider_overlaps(world, nx, player.y, player.z):
         player.x = nx
     else:
@@ -801,7 +906,6 @@ def move_player(world, player, dt):
             player.vx = 0.0
     # --- Z (with climb-up) ---
     nz = player.z + dz
-    nz = max(-30.0, min(30.0, nz))
     if not collider_overlaps(world, player.x, player.y, nz):
         player.z = nz
     else:
@@ -1054,7 +1158,8 @@ def build_quads(world, cam):
         faces.append((fn, d))
 
     opaque = world.opaque
-    colblocks = world.colblocks
+    # colblocks is lazily generated; use world._col to generate missing columns
+    _col = world._col
     W = WIDTH; H = HEIGHT; FRS = FR_S
     shade_table = FACE_SHADE
 
@@ -1062,7 +1167,7 @@ def build_quads(world, cam):
     fs = FACE_SHADE
     for x in range(x0, x1 + 1):
         for z in range(z0, z1 + 1):
-            col = colblocks.get((x, z))
+            col = _col(x, z)
             if not col:
                 continue
             for y, name in col.items():
@@ -1243,8 +1348,6 @@ def _place_at_crosshair(player, world, cam):
         return
     if wy < 0 or wy >= HY + 6:
         return
-    if not (_between(wx, -31, 31) and _between(wz, -31, 31)):
-        return
     world.set(wx, wy, wz, name)
     player.inventory[name] = player.inventory.get(name, 0) - 1
 
@@ -1389,6 +1492,9 @@ def main():
         player.vz = wz * MOVE_SPEED
         # ---- physics + solid-block collision ----
         move_player(world, player, dt)
+        # keep the world bounded: drop columns far away that the player
+        # has not edited and that are not part of the landmark settlement
+        world.evict(player.x, player.z)
         mouse_down = pygame.mouse.get_pressed()[2]
         cam = make_camera(player, world)
         update_mining(player, world, dt, cam, mouse_down)
