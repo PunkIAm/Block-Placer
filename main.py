@@ -32,8 +32,15 @@ NEAR = 0.4
 GRAVITY = 32.0
 MOVE_SPEED = 5.2
 JUMP_VY = 12.5
+COL_HX, COL_HZ = 0.4, 0.4   # player collider half-width/depth (feet at player.y)
+COL_H = 1.8                 # player collider total height (feet to head)
+MAX_FALL = 24.0
+LOOK_SENS = 0.003           # radians of camera turn per mouse pixel
+PITCH_MIN, PITCH_MAX = -1.3, 1.3
 CAM_PITCH = 0.18             # downward look pitch (radians); small so center-ray hits ground blocks
 FR_S = 2.0                   # frustum margin in pixels
+STAND_OFFSET = 0.02          # player feet height above a solid surface top (near-touch)
+CLIMB = 1.6                  # max height (in blocks) the player auto-climbs into a step
 
 # block colors (r,g,b)
 C = {
@@ -353,6 +360,12 @@ class World:
                     b = _raw_block(x, z, y)
                     if b is not None:
                         self.static[(x, y, z)] = b
+        # Per-column index for fast rendering: (x, z) -> {y: name}.
+        # Mirrors the *current* block state (base + player edits) so build_quads
+        # iterates only existing blocks and culls faces by neighbor lookup.
+        self.colblocks = {}
+        for (x, y, z), name in self.static.items():
+            self.colblocks.setdefault((x, z), {})[y] = name
 
     def block(self, x, y, z):
         k = (x, y, z)
@@ -369,6 +382,11 @@ class World:
 
     def set(self, x, y, z, name):
         self.over[(x, y, z)] = name
+        col = self.colblocks.setdefault((x, z), {})
+        if name is None:
+            col.pop(y, None)
+        else:
+            col[y] = name
 
     def _build(self, cx, cz):
         pass
@@ -638,6 +656,7 @@ class Player:
         self.world = world
         self.x, self.y, self.z = 0.0, 5.5, 0.0
         self.vx, self.vy, self.vz = 0.0, 0.0, 0.0
+        self.grounded = False
         self.first_person = False
         self.yaw = 0.0
         self.pitch = CAM_PITCH
@@ -659,6 +678,162 @@ class Player:
 def respawn(player):
     player.x, player.y, player.z = 0.0, 5.5, 0.0
     player.vx, player.vy, player.vz = 0.0, 0.0, 0.0
+    player.grounded = False
+
+
+# -----------------------------------------------------------------------------
+# player collision (per-axis AABB separation against solid blocks)
+# -----------------------------------------------------------------------------
+def collider_overlaps(world, px, py, pz):
+    """True if the player collider (feet at (px,py,pz), height COL_H) overlaps
+    any solid block.  The collider spans
+        x: [px-COL_HX, px+COL_HX]   y: [py, py+COL_H]   z: [pz-COL_HZ, pz+COL_HZ].
+    We test only the integer cells the box actually intersects."""
+    x0 = int(math.floor(px - COL_HX)); x1 = int(math.ceil(px + COL_HX)) - 1
+    y0 = int(math.floor(py));          y1 = int(math.ceil(py + COL_H)) - 1
+    z0 = int(math.floor(pz - COL_HZ)); z1 = int(math.ceil(pz + COL_HZ)) - 1
+    for bx in range(x0, x1 + 1):
+        for by in range(y0, y1 + 1):
+            if by < 0:
+                continue
+            for bz in range(z0, z1 + 1):
+                b = world.block(bx, by, bz)
+                if b is not None and b not in NON_OPAQUE:
+                    # AABB vs unit cell overlap test
+                    if not (px + COL_HX <= bx or px - COL_HX >= bx + 1 or
+                            py + COL_H  <= by or py >= by + 1 or
+                            pz + COL_HZ <= bz or pz - COL_HZ >= bz + 1):
+                        return True
+    return False
+
+
+def _push_back(world, axis, px, py, pz, delta):
+    """Push out of a collision along `axis` by `delta` using exponential bisection.
+    Returns the largest clear fraction (0..1) of delta we can take along that axis."""
+    for s in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625):
+        cand = list([px, py, pz])
+        cand[axis] += delta * s
+        if not collider_overlaps(world, cand[0], cand[1], cand[2]):
+            return s
+    return 0.0
+
+
+def climb_top(world, px, pz, base_y, max_climb):
+    """Top (y+1) of the highest solid block under (px,pz) whose top is above
+    base_y by at most max_climb — the surface we could step up onto.
+    Returns None if there is no climbable step in front."""
+    x0 = int(math.floor(px - COL_HX)); x1 = int(math.ceil(px + COL_HX)) - 1
+    z0 = int(math.floor(pz - COL_HZ)); z1 = int(math.ceil(pz + COL_HZ)) - 1
+    best = None
+    for bx in range(x0, x1 + 1):
+        for bz in range(z0, z1 + 1):
+            for by in range(0, HY + 1):
+                b = world.block(bx, by, bz)
+                if b is not None and b not in NON_OPAQUE:
+                    top = float(by + 1)
+                    if base_y + 0.05 < top <= base_y + max_climb:
+                        if best is None or top > best:
+                            best = top
+    return best
+
+
+def move_player(world, player, dt):
+    """Advance the player with per-axis AABB collision.
+
+    y (gravity) first so we land on top of things, then x and z slide along
+    walls.  Along x and z, if the move is blocked we allow a short climb-up
+    (up to CLIMB blocks) so the player can step up onto building bases / stairs,
+    and falls through gaps, but still cannot pass through a wall.
+    """
+    player.vy -= GRAVITY * dt
+    player.vy = max(player.vy, -MAX_FALL)
+    was_falling = player.vy < 0.0
+    dx = player.vx * dt
+    dy = player.vy * dt
+    dz = player.vz * dt
+
+    # --- Y (gravity) ---
+    oy = player.y
+    ny = oy + dy
+    if ny < 0.0:
+        player.y = 0.0
+        player.vy = 0.0
+        player.grounded = True
+    elif collider_overlaps(world, player.x, ny, player.z):
+        # hit a solid block along Y; rest on the face we struck
+        frac = _push_back(world, 1, player.x, oy, player.z, dy)
+        player.y = oy + dy * frac
+        player.vy = 0.0
+        player.grounded = was_falling
+    else:
+        player.y = ny
+        player.grounded = False
+
+    # --- grounded / standing snap (capped to current feet, no up-teleport) ---
+    surface = grounded_y_at(world, player.x, player.z, cap=player.y + COL_H)
+    if surface is not None:
+        if player.y < surface + STAND_OFFSET + 0.1:
+            # falling onto a surface: snap down to rest on top of it
+            player.y = surface + STAND_OFFSET
+            player.vy = 0.0
+            player.grounded = True
+        else:
+            # already above it (standing on it) — keep the grounded state from Y
+            player.grounded = (player.y - surface - STAND_OFFSET) < 0.05 and player.vy <= 0.0
+    else:
+        player.grounded = False
+
+    # --- X (with climb-up) ---
+    nx = player.x + dx
+    nx = max(-30.0, min(30.0, nx))
+    if not collider_overlaps(world, nx, player.y, player.z):
+        player.x = nx
+    else:
+        # blocked: try stepping up onto a nearby surface (so we can walk onto
+        # building bases / stairs), otherwise push back along X
+        step_top = climb_top(world, nx, player.z, player.y, CLIMB)
+        if step_top is not None and not collider_overlaps(world, nx, step_top, player.z):
+            player.y = step_top
+            player.x = nx
+        else:
+            frac = _push_back(world, 0, nx, player.y, player.z, dx)
+            player.x = player.x + dx * frac
+            player.vx = 0.0
+    # --- Z (with climb-up) ---
+    nz = player.z + dz
+    nz = max(-30.0, min(30.0, nz))
+    if not collider_overlaps(world, player.x, player.y, nz):
+        player.z = nz
+    else:
+        step_top = climb_top(world, player.x, nz, player.y, CLIMB)
+        if step_top is not None and not collider_overlaps(world, player.x, step_top, nz):
+            player.y = step_top
+            player.z = nz
+        else:
+            frac = _push_back(world, 2, player.x, player.y, nz, dz)
+            player.z = player.z + dz * frac
+            player.vz = 0.0
+
+
+def grounded_y_at(world, px, pz, cap=None):
+    """Highest solid surface top under the player's footprint, or None.
+    cap: if given, ignore any surface top higher than `cap`.  This prevents the
+    player from being snapped up to a building roof / overhang above their
+    feet — we only land on a surface that is at or below the current feet."""
+    x0 = int(math.floor(px - COL_HX)); x1 = int(math.ceil(px + COL_HX)) - 1
+    z0 = int(math.floor(pz - COL_HZ)); z1 = int(math.ceil(pz + COL_HZ)) - 1
+    best = None
+    for bx in range(x0, x1 + 1):
+        for bz in range(z0, z1 + 1):
+            for by in range(0, HY + 1):
+                b = world.block(bx, by, bz)
+                if b is not None and b not in NON_OPAQUE:
+                    top = float(by + 1)
+                    if cap is not None and top > cap:
+                        continue
+                    if best is None or top > best:
+                        best = top
+    return best
 
 
 # -----------------------------------------------------------------------------
@@ -827,60 +1002,103 @@ def _shade(color, k):
     return (r, g, b)
 
 def build_quads(world, cam):
-    """Build visible quads. Returns list of (z, sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, color)."""
+    """Build visible quads (back-face + neighbor culling).
+    Returns list of (depth, sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, color).
+
+    Per frame, only ~half the faces are front-facing (camera side). We
+    skip every face whose outward normal points away from the camera
+    (dot(normal, forward) >= 0) BEFORE we spend any projection work on it.
+    Then, for the front-facing faces, we skip any whose neighbor cell is
+    solid (voxel culling) so we only ever project faces that are actually
+    visible. The eye->screen basis is computed once for the whole camera.
+    """
     eye, f = cam
     quads = []
     R = RADIUS_BY_Q[QUALITY]
     ex, ey, ez = eye
     x0 = int(ex - R); x1 = int(ex + R)
     z0 = int(ez - R); z1 = int(ez + R)
+
+    # --- camera projection basis (compute once) ---
+    up = (0.0, 1.0, 0.0)
+    fu = up[0]*f[0] + up[1]*f[1] + up[2]*f[2]
+    u = normalize((up[0] - fu*f[0], up[1] - fu*f[1], up[2] - fu*f[2]))
+    r = normalize((f[1]*u[2] - f[2]*u[1],
+                  f[2]*u[0] - f[0]*u[2],
+                  f[0]*u[1] - f[1]*u[0]))
+    sc = H2 / _tanfov * (W2 / H2)
+    scy = H2 / _tanfov
+    W2px, H2px = W2, H2
+    f0, f1, f2 = f[0], f[1], f[2]
+
+    # Project to (sx, sy, depth) using the cached basis; depth = vz (forward
+    # distance). Cheap: no per-corner normalize.
+    def p2(wx, wy, wz):
+        dx = wx - ex; dy = wy - ey; dz = wz - ez
+        vz = dx*f0 + dy*f1 + dz*f2
+        if vz <= NEAR:
+            return None
+        vx = dx*r[0] + dy*r[1] + dz*r[2]
+        vy = dx*u[0] + dy*u[1] + dz*u[2]
+        inv = 1.0 / vz
+        return (W2px + vx * inv * sc, H2px - vy * inv * scy, vz)
+
+    # Front-facing faces only, precomputed dot(normal, forward) once per frame.
+    # A face is visible iff its normal points toward the camera (away from
+    # the forward look direction), i.e. dot(normal, forward) < 0.
+    faces = []
+    for fn in FACE_NORMALS:
+        d = fn[0]*f0 + fn[1]*f1 + fn[2]*f2
+        if d >= 0.0:
+            continue
+        faces.append((fn, d))
+
+    opaque = world.opaque
+    colblocks = world.colblocks
+    W = WIDTH; H = HEIGHT; FRS = FR_S
+    shade_table = FACE_SHADE
+
+    fc = FACE_CORNERS
+    fs = FACE_SHADE
     for x in range(x0, x1 + 1):
         for z in range(z0, z1 + 1):
-            # quick: is there any block in this column?
-            top = terrain_top(x, z)
-            if top is None:
+            col = colblocks.get((x, z))
+            if not col:
                 continue
-            for y in range(0, top + 15):
-                name = world.block(x, y, z)
-                if name is None:
-                    continue
-                col = C.get(name, (120, 120, 120))
-                for ni, fn in enumerate(FACE_NORMALS):
-                    # back-face culling
-                    if dot(fn, f) >= 0.0:
+            for y, name in col.items():
+                colc = C.get(name, (120, 120, 120))
+                for fn, _ in faces:
+                    nx, ny, nz = fn
+                    if opaque(x + nx, y + ny, z + nz):
                         continue
-                    corners = FACE_CORNERS[fn]
-                    pts = []
-                    depths = []
-                    on_screen = True
-                    for (dx, dy, dz) in corners:
-                        wx = x + dx
-                        wy = y + dy
-                        wz = z + dz
-                        p = proj((wx, wy, wz), eye, f)
-                        if p is None:
-                            on_screen = False
-                            break
-                        on_screen = True
-                        pts.append((p[0], p[1]))
-                        depths.append(p[2])
-                    if not on_screen:
-                        continue
-                    # frustum: keep quad only if at least one corner is on screen
-                    if not any((-FR_S < px <= WIDTH + FR_S and -FR_S <= py <= HEIGHT + FR_S)
-                               for px, py in pts):
-                        continue
-                    depth = sum(depths) / len(depths)
-                    # per-face shading
-                    sh = FACE_SHADE.get(fn, 1.0)
-                    # brightness boost by distance (atmospheric)
-                    dc = 1.0 / (1.0 + depth * 0.004)
-                    col2 = _shade(col, sh * dc)
-                    quads.append((depth, pts[0][0], pts[0][1],
-                                  pts[1][0], pts[1][1],
-                                  pts[2][0], pts[2][1],
-                                  pts[3][0], pts[3][1], col2))
+                    corners = fc[fn]
+                    a = p2(x + corners[0][0], y + corners[0][1], z + corners[0][2])
+                    b = p2(x + corners[1][0], y + corners[1][1], z + corners[1][2])
+                    c = p2(x + corners[2][0], y + corners[2][1], z + corners[2][2])
+                    d = p2(x + corners[3][0], y + corners[3][1], z + corners[3][2])
+                    _push_quad(quads, (a, b, c, d), colc, fs[fn], W, H, FRS)
     return quads
+
+
+def _push_quad(quads, pts, col, shade, W, H, FRS):
+    """Append a quad only if all four corners project AND at least one is on
+    screen. Depth = average vz of the four corners."""
+    a, b, c, d = pts
+    if a is None or b is None or c is None or d is None:
+        return
+    sx0, sy0, dz0 = a
+    sx1, sy1, dz1 = b
+    sx2, sy2, dz2 = c
+    sx3, sy3, dz3 = d
+    if not ((-FRS <= sx0 <= W + FRS and -FRS <= sy0 <= H + FRS) or
+            (-FRS <= sx1 <= W + FRS and -FRS <= sy1 <= H + FRS) or
+            (-FRS <= sx2 <= W + FRS and -FRS <= sy2 <= H + FRS) or
+            (-FRS <= sx3 <= W + FRS and -FRS <= sy3 <= H + FRS)):
+        return
+    depth = (dz0 + dz1 + dz2 + dz3) * 0.25
+    dc = 1.0 / (1.0 + depth * 0.004)
+    col2 = _shade(col, shade * dc)
+    quads.append((depth, sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, col2))
 
 def draw_quads(surf, quads):
     # painter's: farthest first — quads carry their depth in q[0]; larger
@@ -1050,9 +1268,14 @@ def main():
         except Exception:
             screen = pygame.display.set_mode((WIDTH, HEIGHT))
             fullscreen = False
+    # Minecraft-style free look: we drive camera rotation from mouse movement
+    # each frame (delta from pygame.mouse.get_pos, then recenter to center) so
+    # you can look by pointing the mouse in any direction.  No set_rel here
+    # (this SDL build lacks it), so we simulate relative mode manually.
     clock = pygame.time.Clock()
     world = World(seed=1337)
     player = Player(world)
+    last_mpos = (W2, H2)
     start = time.time()
     hint_until = start + 8.0
     global player_global_x
@@ -1063,7 +1286,8 @@ def main():
                 sys.exit()
             if e.type == pygame.MOUSEWHEEL:
                 # mouse wheel = look up / down (vertical aiming)
-                player.pitch = max(-1.3, min(1.3, player.pitch - e.delta * 0.05))
+                player.pitch = max(PITCH_MIN, min(PITCH_MAX,
+                                                 player.pitch - e.delta * 0.05))
             if e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_ESCAPE:
                     pygame.quit()
@@ -1125,46 +1349,46 @@ def main():
         dt = clock.tick(FPS)
         if dt > 0.0:
             dt = min(dt, 0.05)
-        # movement (WASD relative to camera yaw; arrow keys turn camera)
+        # ---- mouse look (simulate relative mode) ----
+        # This SDL build has no mouse.set_rel, so each frame we read the raw
+        # cursor, apply the delta to yaw/pitch, and recenter the cursor to the
+        # screen center.  Net effect: drag the mouse in any direction to look,
+        # and it never runs off the edge of the window.
+        mp = pygame.mouse.get_pos()
+        mdx = mp[0] - last_mpos[0]
+        mdy = mp[1] - last_mpos[1]
+        last_mpos = (W2, H2)
+        try:
+            pygame.mouse.set_pos(W2, H2)
+        except Exception:
+            pass
+        player.yaw += mdx * LOOK_SENS
+        player.pitch = max(PITCH_MIN, min(PITCH_MAX, player.pitch + mdy * LOOK_SENS))
+
+        # ---- WASD movement relative to camera yaw ----
         keys = pygame.key.get_pressed()
         ffx = math.sin(player.yaw); ffz = -math.cos(player.yaw)
-        vx = 0.0
-        vz = 0.0
+        mvx = 0.0
+        mvz = 0.0
         if keys[pygame.K_w]:   # forward
-            vx += 1.0
+            mvx += 1.0
         if keys[pygame.K_s]:   # backward
-            vx -= 1.0
+            mvx -= 1.0
         if keys[pygame.K_a]:   # left
-            vz += 1.0
+            mvz += 1.0
         if keys[pygame.K_d]:   # right
-            vz -= 1.0
-        wx = vx * ffx + vz * ffz
-        wz = vx * ffz - vz * ffx
-        player.x += wx * MOVE_SPEED * dt
-        player.z += wz * MOVE_SPEED * dt
-        # camera turn (arrow keys)
+            mvz -= 1.0
+        # arrow keys: secondary camera turn (mouse is the primary control)
         if keys[pygame.K_LEFT] or keys[pygame.K_UP]:
             player.yaw += 0.9 * dt
         if keys[pygame.K_RIGHT] or keys[pygame.K_DOWN]:
             player.yaw -= 0.9 * dt
-        # physics
-        player.vy -= GRAVITY * dt
-        old_y = player.y
-        player.y += player.vy * dt
-        ground_top = terrain_y_at(player.x, player.z)
-        stand_h = 1.2
-        if ground_top is None:
-            if player.y < 0.0:
-                player.y = 0.0
-                player.vy = 0.0
-        else:
-            if player.y <= ground_top + 1.0 and player.vy <= 0.0:
-                player.y = ground_top + stand_h
-                if old_y < ground_top + stand_h + 0.3:
-                    player.vy = 0.0
-        if player.y < 0.0:
-            player.y = 0.0
-            player.vy = 0.0
+        wx = mvx * ffx + mvz * ffz
+        wz = mvx * ffz - mvz * ffx
+        player.vx = wx * MOVE_SPEED
+        player.vz = wz * MOVE_SPEED
+        # ---- physics + solid-block collision ----
+        move_player(world, player, dt)
         mouse_down = pygame.mouse.get_pressed()[2]
         cam = make_camera(player, world)
         update_mining(player, world, dt, cam, mouse_down)
